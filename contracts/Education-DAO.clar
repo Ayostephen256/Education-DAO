@@ -8,6 +8,9 @@
 (define-constant ERR-ALREADY-VOTED (err u405))
 (define-constant ERR-INVALID-PROPOSAL (err u406))
 (define-constant ERR-PROPOSAL-ACTIVE (err u407))
+(define-constant ERR-SELF-DELEGATION (err u408))
+(define-constant ERR-DELEGATION-EXISTS (err u409))
+(define-constant ERR-DELEGATION-NOT-FOUND (err u410))
 
 (define-data-var total-funds uint u0)
 (define-data-var next-proposal-id uint u1)
@@ -56,6 +59,20 @@
 (define-map alumni-proposals
     { alumnus: principal }
     { proposal-count: uint }
+)
+
+(define-map delegations
+    { delegator: principal }
+    {
+        delegate: principal,
+        delegated-at: uint,
+        active: bool,
+    }
+)
+
+(define-map delegation-totals
+    { delegate: principal }
+    { total-delegated-power: uint }
 )
 
 (define-public (register-alumni)
@@ -167,22 +184,22 @@
             ERR-ALREADY-VOTED
         )
 
-        (let ((voting-power (get voting-power voter-data)))
+        (let ((effective-voting-power (get-effective-voting-power voter)))
             (map-set votes {
                 proposal-id: proposal-id,
                 voter: voter,
             } {
                 vote: vote-for,
-                voting-power: voting-power,
+                voting-power: effective-voting-power,
                 voted-at: current-height,
             })
 
             (if vote-for
                 (map-set proposals { proposal-id: proposal-id }
-                    (merge proposal-data { votes-for: (+ (get votes-for proposal-data) voting-power) })
+                    (merge proposal-data { votes-for: (+ (get votes-for proposal-data) effective-voting-power) })
                 )
                 (map-set proposals { proposal-id: proposal-id }
-                    (merge proposal-data { votes-against: (+ (get votes-against proposal-data) voting-power) })
+                    (merge proposal-data { votes-against: (+ (get votes-against proposal-data) effective-voting-power) })
                 )
             )
             (ok true)
@@ -274,10 +291,88 @@
     )
 )
 
+(define-public (delegate-voting-power (delegate principal))
+    (let (
+            (delegator tx-sender)
+            (delegator-data (unwrap! (map-get? alumni { alumnus: delegator }) ERR-UNAUTHORIZED))
+            (delegate-data (unwrap! (map-get? alumni { alumnus: delegate }) ERR-NOT-FOUND))
+            (current-height stacks-block-height)
+        )
+        (asserts! (get active delegator-data) ERR-UNAUTHORIZED)
+        (asserts! (get active delegate-data) ERR-UNAUTHORIZED)
+        (asserts! (not (is-eq delegator delegate)) ERR-SELF-DELEGATION)
+        (asserts! (is-none (map-get? delegations { delegator: delegator }))
+            ERR-DELEGATION-EXISTS
+        )
+
+        (let ((delegator-power (get voting-power delegator-data)))
+            (map-set delegations { delegator: delegator } {
+                delegate: delegate,
+                delegated-at: current-height,
+                active: true,
+            })
+
+            (let ((current-delegated (default-to u0
+                    (get total-delegated-power
+                        (map-get? delegation-totals { delegate: delegate })
+                    ))))
+                (map-set delegation-totals { delegate: delegate } { total-delegated-power: (+ current-delegated delegator-power) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (revoke-delegation)
+    (let (
+            (delegator tx-sender)
+            (delegation-data (unwrap! (map-get? delegations { delegator: delegator })
+                ERR-DELEGATION-NOT-FOUND
+            ))
+            (delegator-data (unwrap! (map-get? alumni { alumnus: delegator }) ERR-UNAUTHORIZED))
+        )
+        (asserts! (get active delegation-data) ERR-DELEGATION-NOT-FOUND)
+
+        (let (
+                (delegate (get delegate delegation-data))
+                (delegator-power (get voting-power delegator-data))
+            )
+            (map-set delegations { delegator: delegator }
+                (merge delegation-data { active: false })
+            )
+
+            (let ((current-delegated (default-to u0
+                    (get total-delegated-power
+                        (map-get? delegation-totals { delegate: delegate })
+                    ))))
+                (map-set delegation-totals { delegate: delegate } { total-delegated-power: (if (>= current-delegated delegator-power)
+                    (- current-delegated delegator-power)
+                    u0
+                ) }
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
 (define-private (calculate-voting-power (contribution uint))
     (if (< contribution u1000000)
         u0
         (/ contribution u1000)
+    )
+)
+
+(define-private (get-effective-voting-power (alumnus principal))
+    (let ((alumni-data (unwrap-panic (map-get? alumni { alumnus: alumnus }))))
+        (let ((own-power (get voting-power alumni-data)))
+            (let ((delegated-power (default-to u0
+                    (get total-delegated-power
+                        (map-get? delegation-totals { delegate: alumnus })
+                    ))))
+                (+ own-power delegated-power)
+            )
+        )
     )
 )
 
@@ -342,4 +437,26 @@
 
 (define-read-only (get-contract-owner)
     CONTRACT-OWNER
+)
+
+(define-read-only (get-delegation-data (delegator principal))
+    (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegation-totals (delegate principal))
+    (map-get? delegation-totals { delegate: delegate })
+)
+
+(define-read-only (get-effective-voting-power-read (alumnus principal))
+    (match (map-get? alumni { alumnus: alumnus })
+        alumni-data (let ((own-power (get voting-power alumni-data)))
+            (let ((delegated-power (default-to u0
+                    (get total-delegated-power
+                        (map-get? delegation-totals { delegate: alumnus })
+                    ))))
+                (+ own-power delegated-power)
+            )
+        )
+        u0
+    )
 )
