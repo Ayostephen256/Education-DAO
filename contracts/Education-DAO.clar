@@ -16,11 +16,16 @@
 (define-constant ERR-MILESTONE-NOT-READY (err u413))
 (define-constant ERR-MILESTONE-FUNDS-RELEASED (err u414))
 (define-constant ERR-NO-MILESTONES (err u415))
+(define-constant ERR-ACHIEVEMENT-NOT-FOUND (err u416))
+(define-constant ERR-ACHIEVEMENT-ALREADY-EARNED (err u417))
+(define-constant ERR-ACHIEVEMENT-NOT-ELIGIBLE (err u418))
+(define-constant ERR-INVALID-DIFFICULTY (err u419))
 
 (define-data-var total-funds uint u0)
 (define-data-var next-proposal-id uint u1)
 (define-data-var voting-duration uint u1008)
 (define-data-var min-voting-power uint u1000000)
+(define-data-var achievement-counter uint u0)
 
 (define-map alumni
     { alumnus: principal }
@@ -117,6 +122,27 @@
         vote: bool,
         voting-power: uint,
         voted-at: uint,
+    }
+)
+
+(define-map achievements
+    { achievement-id: uint }
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        category: (string-ascii 30),
+        difficulty: (string-ascii 20),
+        points: uint,
+        created-at: uint,
+        created-by: principal,
+    }
+)
+
+(define-map alumni-achievements
+    { alumnus: principal, achievement-id: uint }
+    {
+        earned-at: uint,
+        verified: bool,
     }
 )
 
@@ -671,6 +697,122 @@
     )
 )
 
+(define-public (define-achievement
+        (name (string-ascii 50))
+        (description (string-ascii 200))
+        (category (string-ascii 30))
+        (difficulty (string-ascii 20))
+        (points uint)
+    )
+    (let (
+            (achievement-id (+ (var-get achievement-counter) u1))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (> (len name) u0) ERR-INVALID-AMOUNT)
+        (asserts! (> (len description) u0) ERR-INVALID-AMOUNT)
+        (asserts! (> (len category) u0) ERR-INVALID-AMOUNT)
+        (asserts!
+            (or
+                (is-eq difficulty "easy")
+                (is-eq difficulty "medium")
+                (is-eq difficulty "hard")
+                (is-eq difficulty "expert")
+            )
+            ERR-INVALID-DIFFICULTY
+        )
+        (asserts! (> points u0) ERR-INVALID-AMOUNT)
+
+        (map-set achievements { achievement-id: achievement-id } {
+            name: name,
+            description: description,
+            category: category,
+            difficulty: difficulty,
+            points: points,
+            created-at: current-height,
+            created-by: tx-sender,
+        })
+
+        (var-set achievement-counter achievement-id)
+        (ok achievement-id)
+    )
+)
+
+(define-public (award-achievement
+        (alumnus principal)
+        (achievement-id uint)
+    )
+    (let (
+            (achievement-data (unwrap! (map-get? achievements { achievement-id: achievement-id })
+                ERR-ACHIEVEMENT-NOT-FOUND
+            ))
+            (alumni-data (unwrap! (map-get? alumni { alumnus: alumnus }) ERR-NOT-FOUND))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (get active alumni-data) ERR-UNAUTHORIZED)
+        (asserts!
+            (is-none (map-get? alumni-achievements {
+                alumnus: alumnus,
+                achievement-id: achievement-id,
+            }))
+            ERR-ACHIEVEMENT-ALREADY-EARNED
+        )
+
+        (map-set alumni-achievements {
+            alumnus: alumnus,
+            achievement-id: achievement-id,
+        } {
+            earned-at: current-height,
+            verified: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (check-achievement-eligibility
+        (alumnus principal)
+        (achievement-id uint)
+    )
+    (let (
+            (achievement-data (unwrap! (map-get? achievements { achievement-id: achievement-id })
+                ERR-ACHIEVEMENT-NOT-FOUND
+            ))
+            (alumni-data (unwrap! (map-get? alumni { alumnus: alumnus }) ERR-NOT-FOUND))
+        )
+        (asserts! (get active alumni-data) ERR-UNAUTHORIZED)
+        (asserts!
+            (is-none (map-get? alumni-achievements {
+                alumnus: alumnus,
+                achievement-id: achievement-id,
+            }))
+            ERR-ACHIEVEMENT-ALREADY-EARNED
+        )
+
+        (let ((contribution (get contribution alumni-data)))
+            (if (and
+                    (is-eq (get category achievement-data) "contributor")
+                    (>= contribution u5000000)
+                )
+                (ok true)
+                (if (and
+                        (is-eq (get category achievement-data) "governance")
+                        (>= (get voting-power alumni-data) u10000)
+                    )
+                    (ok true)
+                    (if (and
+                            (is-eq (get category achievement-data) "community")
+                            (>= (get-alumni-proposal-count alumnus) u3)
+                        )
+                        (ok true)
+                        ERR-ACHIEVEMENT-NOT-ELIGIBLE
+                    )
+                )
+            )
+        )
+    )
+)
+
 (define-private (calculate-voting-power (contribution uint))
     (if (< contribution u1000000)
         u0
@@ -813,6 +955,7 @@
         )
     )
 )
+
 
 (define-read-only (get-alumni-data (alumnus principal))
     (map-get? alumni { alumnus: alumnus })
@@ -970,6 +1113,63 @@
             )
         )
         false
+    )
+)
+
+(define-read-only (get-achievement-data (achievement-id uint))
+    (map-get? achievements { achievement-id: achievement-id })
+)
+
+(define-read-only (get-alumni-achievement-data
+        (alumnus principal)
+        (achievement-id uint)
+    )
+    (map-get? alumni-achievements {
+        alumnus: alumnus,
+        achievement-id: achievement-id,
+    })
+)
+
+(define-read-only (is-achievement-unlocked
+        (alumnus principal)
+        (achievement-id uint)
+    )
+    (is-some (map-get? alumni-achievements {
+        alumnus: alumnus,
+        achievement-id: achievement-id,
+    }))
+)
+
+(define-read-only (get-total-achievements-count)
+    (var-get achievement-counter)
+)
+
+(define-read-only (get-alumni-total-achievement-points (alumnus principal))
+    (let ((alumni-data (map-get? alumni { alumnus: alumnus })))
+        (match alumni-data
+            data (if (get active data)
+                u0  ;; Return 0 for now, will be calculated by external logic
+                u0
+            )
+            u0
+        )
+    )
+)
+
+(define-read-only (get-achievement-leaderboard-entry (alumnus principal))
+    (let ((alumni-data (map-get? alumni { alumnus: alumnus })))
+        (match alumni-data
+            data (if (get active data)
+                (some {
+                    alumnus: alumnus,
+                    total-points: u0,  ;; Simplified to avoid interdependency
+                    contribution: (get contribution data),
+                    voting-power: (get voting-power data),
+                })
+                none
+            )
+            none
+        )
     )
 )
 
