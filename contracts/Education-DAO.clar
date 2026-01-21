@@ -146,6 +146,16 @@
     }
 )
 
+(define-constant DEFAULT-ALUMNI-STATS { total-points: u0, total-achievements: u0 })
+
+(define-map alumni-stats
+    { alumnus: principal }
+    {
+        total-points: uint,
+        total-achievements: uint,
+    }
+)
+
 (define-public (register-alumni)
     (let ((alumnus tx-sender))
         (asserts! (is-none (map-get? alumni { alumnus: alumnus }))
@@ -738,6 +748,47 @@
     )
 )
 
+(define-public (claim-achievement (achievement-id uint))
+    (let (
+            (alumnus tx-sender)
+            (achievement-data (unwrap! (map-get? achievements { achievement-id: achievement-id })
+                ERR-ACHIEVEMENT-NOT-FOUND
+            ))
+            (alumni-data (unwrap! (map-get? alumni { alumnus: alumnus }) ERR-UNAUTHORIZED))
+            (current-height stacks-block-height)
+            (category (get category achievement-data))
+            (contribution (get contribution alumni-data))
+            (voting-power (get voting-power alumni-data))
+            (proposal-count (default-to u0
+                (get proposal-count (map-get? alumni-proposals { alumnus: alumnus }))
+            ))
+        )
+        (asserts! (get active alumni-data) ERR-UNAUTHORIZED)
+        (asserts!
+            (is-none (map-get? alumni-achievements {
+                alumnus: alumnus,
+                achievement-id: achievement-id,
+            }))
+            ERR-ACHIEVEMENT-ALREADY-EARNED
+        )
+        (asserts!
+            (is-achievement-eligible category contribution voting-power proposal-count)
+            ERR-ACHIEVEMENT-NOT-ELIGIBLE
+        )
+
+        (map-set alumni-achievements {
+            alumnus: alumnus,
+            achievement-id: achievement-id,
+        } {
+            earned-at: current-height,
+            verified: true,
+        })
+
+        (update-alumni-stats alumnus (get points achievement-data))
+        (ok true)
+    )
+)
+
 (define-public (award-achievement
         (alumnus principal)
         (achievement-id uint)
@@ -766,6 +817,8 @@
             earned-at: current-height,
             verified: true,
         })
+
+        (update-alumni-stats alumnus (get points achievement-data))
         (ok true)
     )
 )
@@ -779,6 +832,12 @@
                 ERR-ACHIEVEMENT-NOT-FOUND
             ))
             (alumni-data (unwrap! (map-get? alumni { alumnus: alumnus }) ERR-NOT-FOUND))
+            (category (get category achievement-data))
+            (contribution (get contribution alumni-data))
+            (voting-power (get voting-power alumni-data))
+            (proposal-count (default-to u0
+                (get proposal-count (map-get? alumni-proposals { alumnus: alumnus }))
+            ))
         )
         (asserts! (get active alumni-data) ERR-UNAUTHORIZED)
         (asserts!
@@ -788,28 +847,34 @@
             }))
             ERR-ACHIEVEMENT-ALREADY-EARNED
         )
-
-        (let ((contribution (get contribution alumni-data)))
-            (if (and
-                    (is-eq (get category achievement-data) "contributor")
-                    (>= contribution u5000000)
-                )
-                (ok true)
-                (if (and
-                        (is-eq (get category achievement-data) "governance")
-                        (>= (get voting-power alumni-data) u10000)
-                    )
-                    (ok true)
-                    (if (and
-                            (is-eq (get category achievement-data) "community")
-                            (>= (get-alumni-proposal-count alumnus) u3)
-                        )
-                        (ok true)
-                        ERR-ACHIEVEMENT-NOT-ELIGIBLE
-                    )
-                )
-            )
+        (asserts!
+            (is-achievement-eligible category contribution voting-power proposal-count)
+            ERR-ACHIEVEMENT-NOT-ELIGIBLE
         )
+        (ok true)
+    )
+)
+
+(define-private (is-achievement-eligible
+        (category (string-ascii 30))
+        (contribution uint)
+        (voting-power uint)
+        (proposal-count uint)
+    )
+    (or
+        (and (is-eq category "contributor") (>= contribution u5000000))
+        (and (is-eq category "governance") (>= voting-power u10000))
+        (and (is-eq category "community") (>= proposal-count u3))
+    )
+)
+
+(define-private (update-alumni-stats (alumnus principal) (points uint))
+    (let ((stats (default-to DEFAULT-ALUMNI-STATS (map-get? alumni-stats { alumnus: alumnus }))))
+        (map-set alumni-stats { alumnus: alumnus } {
+            total-points: (+ (get total-points stats) points),
+            total-achievements: (+ (get total-achievements stats) u1),
+        })
+        true
     )
 )
 
@@ -1148,7 +1213,7 @@
     (let ((alumni-data (map-get? alumni { alumnus: alumnus })))
         (match alumni-data
             data (if (get active data)
-                u0  ;; Return 0 for now, will be calculated by external logic
+                u0
                 u0
             )
             u0
@@ -1162,7 +1227,7 @@
             data (if (get active data)
                 (some {
                     alumnus: alumnus,
-                    total-points: u0,  ;; Simplified to avoid interdependency
+                    total-points: u0,
                     contribution: (get contribution data),
                     voting-power: (get voting-power data),
                 })
@@ -1170,6 +1235,47 @@
             )
             none
         )
+    )
+)
+
+(define-read-only (get-alumni-total-achievement-points-v2 (alumnus principal))
+    (match (map-get? alumni { alumnus: alumnus })
+        alumni-data (if (get active alumni-data)
+            (match (map-get? alumni-stats { alumnus: alumnus })
+                stats (get total-points stats)
+                u0
+            )
+            u0
+        )
+        u0
+    )
+)
+
+(define-read-only (get-achievement-leaderboard-entry-v2 (alumnus principal))
+    (match (map-get? alumni { alumnus: alumnus })
+        alumni-data (if (get active alumni-data)
+            (let ((stats (default-to DEFAULT-ALUMNI-STATS (map-get? alumni-stats { alumnus: alumnus }))))
+                (some {
+                    alumnus: alumnus,
+                    total-points: (get total-points stats),
+                    total-achievements: (get total-achievements stats),
+                    contribution: (get contribution alumni-data),
+                    voting-power: (get voting-power alumni-data),
+                })
+            )
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (get-alumni-stats-v2 (alumnus principal))
+    (match (map-get? alumni { alumnus: alumnus })
+        alumni-data (if (get active alumni-data)
+            (some (default-to DEFAULT-ALUMNI-STATS (map-get? alumni-stats { alumnus: alumnus })))
+            none
+        )
+        none
     )
 )
 
